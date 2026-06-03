@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff mypy python-gnupg
+
+      - name: ruff (style + unused imports)
+        run: ruff check gitsec.py
+
+      - name: mypy (type checking)
+        run: mypy gitsec.py --ignore-missing-imports --strict-optional
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Bandit and pip-audit
+        run: pip install bandit[toml] pip-audit python-gnupg
+
+      - name: Bandit SAST scan
+        # B105/B106/B107: hardcoded password heuristics generate false positives
+        # on the MIN_RSA_BITS / MIN_ECDSA_BITS constants; skipped intentionally.
+        run: |
+          bandit -r gitsec.py \
+            --skip B105,B106,B107 \
+            --severity-level medium \
+            --confidence-level medium \
+            -f txt
+
+      - name: pip-audit (dependency CVEs)
+        run: pip-audit --requirement <(pip freeze) --strict
+
+  test-linux:
+    name: Test — Linux
+    runs-on: ubuntu-latest
+    needs: [lint, security-scan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GnuPG
+        run: sudo apt-get install -y gnupg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install python-gnupg pytest
+
+      - name: Syntax check
+        run: python -m py_compile gitsec.py
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+        env:
+          GNUPGHOME: /tmp/test-gnupghome
+
+  test-windows:
+    name: Test — Windows
+    runs-on: windows-latest
+    needs: [lint, security-scan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Gpg4win (silent)
+        shell: powershell
+        run: |
+          choco install gpg4win --no-progress -y
+          echo "C:\Program Files (x86)\GnuPG\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install python-gnupg pytest
+
+      - name: Syntax check
+        run: python -m py_compile gitsec.py
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
