@@ -1,0 +1,39 @@
+name: Trivy
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy in filesystem mode
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          # SECRET scanning catches any credentials accidentally committed
+          # alongside the tool; VULN covers Python package advisories.
+          scanners: vuln,secret,misconfig
+          severity: MEDIUM,HIGH,CRITICAL
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "1"
+
+      - name: Upload results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
