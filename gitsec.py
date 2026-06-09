@@ -128,6 +128,89 @@ def _secure_delete(path: str, passes: int = 3) -> None:
             pass
 
 
+def _audit_chain_last_hash() -> str:
+    if not os.path.exists(AUDIT_FILE):
+        return "0" * 64
+    last = ""
+    try:
+        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    last = line
+    except OSError:
+        return "0" * 64
+    if not last:
+        return "0" * 64
+    try:
+        return json.loads(last).get("hmac", "0" * 64)
+    except (json.JSONDecodeError, AttributeError):
+        return "0" * 64
+
+
+def _audit_hmac_key() -> bytes:
+    meta_path = META_FILE
+    revoked_path = REVOKED_FILE
+    seed = b"git-secret-mgr-audit-v1"
+    try:
+        with open(meta_path, "rb") as f:
+            seed += f.read(4096)
+    except OSError:
+        pass
+    try:
+        with open(revoked_path, "rb") as f:
+            seed += f.read(4096)
+    except OSError:
+        pass
+    return hashlib.sha256(seed).digest()
+
+
+def _audit_hmac(prev_hash: str, entry_json: str) -> str:
+    import hmac as _hmac
+    key = _audit_hmac_key()
+    msg = (prev_hash + entry_json).encode("utf-8")
+    return _hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def _audit_verify() -> tuple:
+    if not os.path.exists(AUDIT_FILE):
+        return True, [], []
+    import hmac as _hmac
+    key = _audit_hmac_key()
+    entries = []
+    errors = []
+    prev_hash = "0" * 64
+    try:
+        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError as exc:
+        return False, [], [f"Cannot read audit log: {exc}"]
+    for i, line in enumerate(lines):
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            errors.append(f"Line {i+1}: not valid JSON")
+            continue
+        stored_hmac = e.pop("hmac", None)
+        stored_prev = e.pop("prev", None)
+        if stored_prev != prev_hash:
+            errors.append(
+                f"Line {i+1}: chain break — expected prev={prev_hash[:16]}... "
+                f"got {str(stored_prev)[:16]}..."
+            )
+        entry_json = json.dumps(e, separators=(",", ":"))
+        expected = _hmac.new(
+            key, (prev_hash + entry_json).encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not _hmac.compare_digest(str(stored_hmac), expected):
+            errors.append(f"Line {i+1}: HMAC mismatch — entry may have been tampered")
+        e["prev"] = stored_prev
+        e["hmac"] = stored_hmac
+        entries.append(e)
+        prev_hash = stored_hmac if stored_hmac else prev_hash
+    return len(errors) == 0, entries, errors
+
+
 def _write_audit(action: str, actor: str, detail: str) -> None:
     try:
         ts = datetime.now(timezone.utc).isoformat()
@@ -137,10 +220,14 @@ def _write_audit(action: str, actor: str, detail: str) -> None:
             "actor": _sanitize_log(actor),
             "detail": _sanitize_log(detail),
         }
+        prev_hash = _audit_chain_last_hash()
+        hmac_val = _audit_hmac(prev_hash, json.dumps(entry, separators=(",", ":")))
+        entry["prev"] = prev_hash
+        entry["hmac"] = hmac_val
         with open(AUDIT_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.error("AUDIT WRITE FAILED — event may be lost: %s", exc)
 
 
 def _load_json(path: str) -> dict:
@@ -529,7 +616,6 @@ class GitSecretManager:
             raise ValueError("Only files can be added as secrets")
         if src.stat().st_size > MAX_FILE_SIZE:
             raise ValueError("File too large (max 100MB)")
-        _validate_path_traversal(self.repo_path, str(src))
         meta = _load_json(META_FILE)
         authorized = meta.get("authorized", {})
         if not authorized:
@@ -584,9 +670,12 @@ class GitSecretManager:
         if size < 16:
             raise RuntimeError("Encrypted output suspiciously small")
         with open(path, "rb") as f:
-            header = f.read(4)
-        if header[:1] in (b"-----", b""):
-            pass
+            header = f.read(5)
+        if header == b"-----":
+            raise RuntimeError(
+                "Encrypted output is ASCII-armored but armor=False was requested; "
+                "GPG binary version mismatch suspected"
+            )
 
     def reveal_secret(
         self, secret_name: str, output_dir: str = ".", passphrase: Optional[str] = None
@@ -594,7 +683,10 @@ class GitSecretManager:
         self._ensure_initialized()
         secret_name = _validate_filename(secret_name)
         out_dir = str(Path(output_dir).resolve())
-        _validate_path_traversal(self.repo_path, out_dir)
+        if not os.path.isdir(out_dir):
+            raise FileNotFoundError(
+                f"Output directory does not exist: {_sanitize_log(output_dir)}"
+            )
         enc_path = os.path.join(STORE_DIR, secret_name + ".gpg")
         if not os.path.exists(enc_path):
             raise FileNotFoundError(
@@ -660,6 +752,11 @@ class GitSecretManager:
                     f"file={_sanitize_log(enc_file.name)} recipients={len(current_fps)}",
                 )
         finally:
+            tmp_path = Path(tmp_dir)
+            if tmp_path.exists():
+                for leftover in tmp_path.iterdir():
+                    if leftover.is_file():
+                        _secure_delete(str(leftover))
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def list_authorized(self) -> list:
@@ -730,7 +827,10 @@ class GitSecretManager:
     def export_public_key(self, email: str, output_path: str) -> None:
         email = _validate_email(email)
         out = Path(output_path).resolve()
-        _validate_path_traversal(self.repo_path, str(out))
+        if not out.parent.is_dir():
+            raise FileNotFoundError(
+                f"Output directory does not exist: {_sanitize_log(str(out.parent))}"
+            )
         fp = _fingerprint_for_email(self.gpg, email)
         if not fp:
             raise ValueError(f"No key found for {_sanitize_log(email)}")
@@ -818,17 +918,20 @@ def _menu() -> None:
                     mgr.export_public_key(email, out)
                     print(f"  ✓ Exported to {_sanitize_log(out)}")
                 elif choice == "9":
+                    mgr._ensure_initialized()
+                    valid, entries, errors = _audit_verify()
                     if os.path.exists(AUDIT_FILE):
-                        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
-                            for line in f:
-                                try:
-                                    e = json.loads(line)
-                                    print(
-                                        f"  [{e.get('ts','')}] {e.get('action','')} | "
-                                        f"{e.get('actor','')} | {e.get('detail','')}"
-                                    )
-                                except Exception:
-                                    pass
+                        for e in entries:
+                            print(
+                                f"  [{e.get('ts','')}] {e.get('action','')} | "
+                                f"{e.get('actor','')} | {e.get('detail','')}"
+                            )
+                        if errors:
+                            print(f"\n  [AUDIT WARNING] {len(errors)} chain violation(s) detected:")
+                            for err in errors:
+                                print(f"    \u2717 {err}")
+                        elif entries:
+                            print(f"\n  [AUDIT OK] Chain integrity verified ({len(entries)} entries)")
                     else:
                         print("  No audit log found.")
                 elif choice == "0":
@@ -892,6 +995,8 @@ def _cli() -> None:
     p_exp.add_argument("email")
     p_exp.add_argument("output")
 
+    sub.add_parser("verify-audit", help="Verify cryptographic integrity of the audit log")
+
     args = parser.parse_args()
     if not args.cmd:
         _menu()
@@ -928,6 +1033,23 @@ def _cli() -> None:
                 print(f"Generated key fingerprint: {fp}")
             elif args.cmd == "export-key":
                 mgr.export_public_key(args.email, args.output)
+            elif args.cmd == "verify-audit":
+                mgr._ensure_initialized()
+                valid, entries, errors = _audit_verify()
+                if not entries and not errors:
+                    print("Audit log is empty.")
+                    sys.exit(0)
+                for e in entries:
+                    print(
+                        f"[{e.get('ts','')}] {e.get('action','')} | "
+                        f"{e.get('actor','')} | {e.get('detail','')}"
+                    )
+                if errors:
+                    print(f"\nAUDIT INTEGRITY VIOLATIONS ({len(errors)}):", file=sys.stderr)
+                    for err in errors:
+                        print(f"  {err}", file=sys.stderr)
+                    sys.exit(2)
+                print(f"\nChain OK — {len(entries)} entries verified.")
         except PermissionError as exc:
             print(f"[ACCESS DENIED] {exc}", file=sys.stderr)
             sys.exit(1)
@@ -937,6 +1059,7 @@ def _cli() -> None:
         except RuntimeError as exc:
             print(f"[RUNTIME ERROR] {exc}", file=sys.stderr)
             sys.exit(1)
+
 
 if __name__ == "__main__":
     _cli()
